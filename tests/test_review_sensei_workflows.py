@@ -14,13 +14,16 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 
 def python_block(name, marker="python - <<'PY'"):
+    'Extract the embedded Python block using the generated workflow layout.'
     text = (WORKFLOWS / name).read_text(encoding="utf-8")
     block = text.split(marker + "\n", 1)[1].split("          PY\n", 1)[0]
     return "\n".join(line[10:] for line in block.splitlines())
 
 
 class RefValidationTests(unittest.TestCase):
+    'Check fallback validation against actual Git branch rules.'
     def test_git_branch_rules(self):
+        'Accept valid special characters and reject malformed branch refs.'
         source = python_block(
             "review-sensei-review.yml",
             'python - "$pull_json" "$EVENT_NAME" "$COMMENT_BODY" <<\'PY\'',
@@ -41,6 +44,7 @@ class CleanupFixture:
     """Persist remote branch/PR state across fresh simulated Actions runners."""
 
     def __init__(self):
+        'Initialize a cleanup operation with no published branch or PR.'
         self.remote_exists = False
         self.prs = []
         self.files_exist = True
@@ -53,6 +57,7 @@ class CleanupFixture:
         self.delta = b"D\0.reviewsensei.yml\0"
 
     def run(self, args, check=False, **kwargs):
+        'Simulate subprocess effects while retaining remote state across dispatches.'
         self.calls.append(args)
         status = 0
         if args[1] == "ls-remote":
@@ -76,12 +81,14 @@ class CleanupFixture:
         return subprocess.CompletedProcess(args, status)
 
     def output(self, args, **kwargs):
+        'Return Git metadata or repository-qualified PR query fixtures.'
         self.calls.append(args)
         if args[0] == "git":
             return "a" * 40 if args[1] in ("merge-base", "rev-parse") else self.delta
         return json.dumps([dict({"headRepositoryOwner": {"login": "chirag127"}, "isCrossRepository": False}, **pr) for pr in self.prs])
 
     def dispatch(self):
+        'Execute the workflow block with isolated environment and command mocks.'
         source = python_block("review-sensei-uninstall.yml")
         with patch.dict(os.environ, {"DEFAULT_BRANCH": "main", "REPOSITORY": "chirag127/google-transparency-report-analysis"}), patch.object(subprocess, "run", self.run), patch.object(subprocess, "check_output", self.output):
             try:
@@ -92,13 +99,16 @@ class CleanupFixture:
 
 
 class CleanupTests(unittest.TestCase):
+    'Verify cleanup publication is retry-safe and preserves existing PR history.'
     def test_repeated_dispatch_reuses_pr(self):
+        'Ensure a second dispatch does not create another commit or PR.'
         fixture = CleanupFixture()
         fixture.dispatch()
         fixture.dispatch()
         self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (1, 1, 1))
 
     def test_recover_push_success_create_failure(self):
+        'Recover a published branch without recommitting after PR creation fails.'
         fixture = CleanupFixture()
         fixture.fail_create = True
         with self.assertRaises(subprocess.CalledProcessError):
@@ -110,6 +120,7 @@ class CleanupTests(unittest.TestCase):
         self.assertIn(["git", "switch", "--create", "review-sensei/uninstall", "FETCH_HEAD"], fixture.calls)
 
     def test_same_named_fork_pr_does_not_block_cleanup(self):
+        'Ignore a fork PR whose branch name matches the cleanup branch.'
         fixture = CleanupFixture()
         fixture.prs = [{"state": "OPEN", "url": "https://example.invalid/fork/1",
                         "headRepositoryOwner": {"login": "other"}, "isCrossRepository": True}]
@@ -117,6 +128,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (1, 1, 1))
 
     def test_closed_or_merged_pr_is_preserved(self):
+        'Leave closed and merged cleanup history untouched.'
         for state in ("CLOSED", "MERGED"):
             with self.subTest(state=state):
                 fixture = CleanupFixture()
@@ -125,12 +137,14 @@ class CleanupTests(unittest.TestCase):
                 self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (0, 0, 0))
 
     def test_already_absent_does_not_publish(self):
+        'Avoid publication when setup files are already absent.'
         fixture = CleanupFixture()
         fixture.files_exist = False
         fixture.dispatch()
         self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (0, 0, 0))
 
     def test_remote_lookup_failure_fails_closed(self):
+        'Stop before publication when remote branch discovery fails.'
         fixture = CleanupFixture()
         fixture.remote_error = 128
         with self.assertRaises(SystemExit):
@@ -138,6 +152,7 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (0, 0, 0))
 
     def test_serialized_without_cancellation_or_run_specific_branch(self):
+        'Keep cleanup dispatches serialized without force pushes.'
         source = (WORKFLOWS / "review-sensei-uninstall.yml").read_text(encoding="utf-8")
         self.assertIn("concurrency:\n  group: review-sensei-uninstall\n  cancel-in-progress: false", source)
         self.assertNotIn("github.run_id", source)
@@ -145,7 +160,9 @@ class CleanupTests(unittest.TestCase):
 
 
 class RecoveryGitTests(unittest.TestCase):
+    'Exercise recovery guards against real Git histories.'
     def test_real_git_recovery_provenance(self):
+        'Allow only scoped deletions based on the current default commit.'
         import tempfile
         source = python_block("review-sensei-uninstall.yml")
         start = source.index('    base = subprocess.check_output')
@@ -156,8 +173,10 @@ class RecoveryGitTests(unittest.TestCase):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 def git(*args):
+                    'Run a Git command inside this temporary fixture repository.'
                     return real_output(["git", "-C", directory, *args], stderr=subprocess.DEVNULL)
                 def commit():
+                    'Commit the current fixture state with a test-only identity.'
                     git("add", "-A")
                     git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture")
                 git("init", "-b", "main")
@@ -180,6 +199,7 @@ class RecoveryGitTests(unittest.TestCase):
                     (root / "new-default.txt").write_text("new")
                     commit()
                 def output(args, **kwargs):
+                    'Run recovery metadata queries in the temporary fixture repository.'
                     return real_output(args, cwd=directory, **kwargs)
                 with patch.object(subprocess, "check_output", output):
                     if scenario == "valid":
@@ -189,6 +209,7 @@ class RecoveryGitTests(unittest.TestCase):
                             exec(guard, {"subprocess": subprocess, "paths": (".reviewsensei.yml",)})
 
     def test_default_branch_collision(self):
+        'Reject cleanup when its branch name equals the default branch.'
         source = python_block("review-sensei-uninstall.yml")
         with patch.dict(os.environ, {"DEFAULT_BRANCH": "review-sensei/uninstall"}):
             with self.assertRaisesRegex(SystemExit, "must not be the default"):
