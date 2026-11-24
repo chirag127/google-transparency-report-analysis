@@ -38,9 +38,10 @@ def test_index_loads(page: Page):
 def test_page_loads_no_error(page: Page, path: str):
     errors = []
     page.on("console", lambda msg: errors.append(msg) if msg.type == "error" else None)
-    page.goto(f"{BASE}{path}")
-    # must not 404
-    assert page.url != f"{BASE}/404.html"
+    response = page.goto(f"{BASE}{path}")
+    # Static servers keep the requested URL even when returning an error page.
+    assert response is not None, f"{path} did not return an HTTP response"
+    assert response.ok, f"{path} returned HTTP {response.status}"
     # no JS console errors
     assert not errors, f"{path} had console errors: {[e.text for e in errors]}"
 
