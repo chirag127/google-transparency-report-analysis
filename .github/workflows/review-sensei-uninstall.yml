@@ -8,6 +8,11 @@ permissions:
   contents: write
   pull-requests: write
 
+# Serialize dispatches and reruns that share the cleanup branch.
+concurrency:
+  group: review-sensei-uninstall
+  cancel-in-progress: false
+
 jobs:
   cleanup:
     runs-on: ubuntu-latest
@@ -22,39 +27,58 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
           import os
-          import re
+          import json
           import subprocess
           import sys
 
           default_branch = os.environ.get("DEFAULT_BRANCH", "")
-          run_id = os.environ.get("RUN_ID", "")
-          if not re.fullmatch(r"[A-Za-z0-9._/-]+", default_branch):
+          if not default_branch or default_branch.startswith("-") or subprocess.run(
+              ["git", "check-ref-format", f"refs/heads/{default_branch}"],
+              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+          ).returncode != 0:
               print("::error::repository default branch is unavailable", file=sys.stderr)
               sys.exit(1)
-          if not re.fullmatch(r"[0-9]+", run_id):
-              print("::error::workflow run id is unavailable", file=sys.stderr)
-              sys.exit(1)
-          branch = f"review-sensei/uninstall-{run_id}"
+          branch = "review-sensei/uninstall"
           paths = (
               ".github/workflows/review-sensei-review.yml",
               ".github/workflows/review-sensei-uninstall.yml",
               ".reviewsensei.yml",
               ".github/review-sensei/config.yml",
           )
-          subprocess.run(["git", "switch", "--create", branch], check=True)
+          # Reuse the operation after a successful push, including PR-create failures.
+          existing = json.loads(subprocess.check_output([
+              "gh", "pr", "list", "--state", "all", "--head", branch,
+              "--base", default_branch, "--json", "state,url",
+          ], text=True))
+          if existing:
+              print(f"Cleanup PR already exists: {existing[0]['url']} ({existing[0]['state']}).")
+              sys.exit(0)
+          remote = subprocess.run([
+              "git", "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{branch}",
+          ], stdout=subprocess.DEVNULL, check=False)
+          if remote.returncode == 0:
+              subprocess.run(["git", "fetch", "origin", f"refs/heads/{branch}"], check=True)
+              subprocess.run(["git", "switch", "--create", branch, "FETCH_HEAD"], check=True)
+          elif remote.returncode == 2:
+              subprocess.run(["git", "switch", "--create", branch], check=True)
+          else:
+              raise SystemExit("Cannot determine whether the cleanup branch exists")
           for path in paths:
               subprocess.run(["git", "rm", "--force", "--ignore-unmatch", "--", path], check=True)
-          if subprocess.run(["git", "diff", "--cached", "--quiet", "--", *paths]).returncode == 0:
+          changes = subprocess.run(["git", "diff", "--cached", "--quiet", "--", *paths]).returncode
+          if changes not in (0, 1):
+              raise SystemExit("Cannot inspect cleanup changes")
+          if changes == 0 and remote.returncode == 2:
               print("ReviewSensei setup files are already absent; no cleanup PR is needed.")
               sys.exit(0)
-          subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
-          subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
-          subprocess.run(["git", "commit", "-m", "Remove ReviewSensei setup"], check=True)
-          subprocess.run(["git", "push", "--set-upstream", "origin", branch], check=True)
+          if changes == 1:
+              subprocess.run(["git", "-c", "user.name=github-actions[bot]", "-c",
+                  "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+                  "commit", "-m", "Remove ReviewSensei setup"], check=True)
+              subprocess.run(["git", "push", "--set-upstream", "origin", branch], check=True)
           subprocess.run([
               "gh", "pr", "create", "--base", default_branch, "--head", branch,
               "--title", "Remove ReviewSensei setup",
