@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import unittest
+import tempfile
 from unittest.mock import patch
 
 
@@ -49,6 +50,7 @@ class CleanupFixture:
         self.commits = 0
         self.pushes = 0
         self.creates = 0
+        self.delta = b"D\0.reviewsensei.yml\0"
 
     def run(self, args, check=False, **kwargs):
         self.calls.append(args)
@@ -75,11 +77,13 @@ class CleanupFixture:
 
     def output(self, args, **kwargs):
         self.calls.append(args)
-        return json.dumps(self.prs)
+        if args[0] == "git":
+            return "a" * 40 if args[1] in ("merge-base", "rev-parse") else self.delta
+        return json.dumps([dict({"headRepositoryOwner": {"login": "chirag127"}, "isCrossRepository": False}, **pr) for pr in self.prs])
 
     def dispatch(self):
         source = python_block("review-sensei-uninstall.yml")
-        with patch.dict(os.environ, {"DEFAULT_BRANCH": "main"}), patch.object(subprocess, "run", self.run), patch.object(subprocess, "check_output", self.output):
+        with patch.dict(os.environ, {"DEFAULT_BRANCH": "main", "REPOSITORY": "chirag127/google-transparency-report-analysis"}), patch.object(subprocess, "run", self.run), patch.object(subprocess, "check_output", self.output):
             try:
                 exec(compile(source, "cleanup-workflow", "exec"), {})
             except SystemExit as exc:
@@ -104,6 +108,13 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (1, 1, 2))
         self.assertIn(["git", "fetch", "origin", "refs/heads/review-sensei/uninstall"], fixture.calls)
         self.assertIn(["git", "switch", "--create", "review-sensei/uninstall", "FETCH_HEAD"], fixture.calls)
+
+    def test_same_named_fork_pr_does_not_block_cleanup(self):
+        fixture = CleanupFixture()
+        fixture.prs = [{"state": "OPEN", "url": "https://example.invalid/fork/1",
+                        "headRepositoryOwner": {"login": "other"}, "isCrossRepository": True}]
+        fixture.dispatch()
+        self.assertEqual((fixture.commits, fixture.pushes, fixture.creates), (1, 1, 1))
 
     def test_closed_or_merged_pr_is_preserved(self):
         for state in ("CLOSED", "MERGED"):
@@ -131,6 +142,57 @@ class CleanupTests(unittest.TestCase):
         self.assertIn("concurrency:\n  group: review-sensei-uninstall\n  cancel-in-progress: false", source)
         self.assertNotIn("github.run_id", source)
         self.assertNotIn('"--force"', source.split('"git", "push"', 1)[1])
+
+
+class RecoveryGitTests(unittest.TestCase):
+    def test_real_git_recovery_provenance(self):
+        import tempfile
+        source = python_block("review-sensei-uninstall.yml")
+        start = source.index('    base = subprocess.check_output')
+        end = source.index('    subprocess.run(["git", "switch"', start)
+        guard = "\n".join(line[4:] for line in source[start:end].splitlines())
+        real_output = subprocess.check_output
+        for scenario in ("valid", "modify", "add", "rename", "diverged", "empty"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                def git(*args):
+                    return real_output(["git", "-C", directory, *args], stderr=subprocess.DEVNULL)
+                def commit():
+                    git("add", "-A")
+                    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "fixture")
+                git("init", "-b", "main")
+                (root / ".reviewsensei.yml").write_text("setup")
+                (root / "unrelated.txt").write_text("original")
+                commit()
+                original = git("rev-parse", "HEAD").decode().strip()
+                if scenario != "empty":
+                    (root / ".reviewsensei.yml").unlink()
+                    if scenario == "modify":
+                        (root / "unrelated.txt").write_text("changed")
+                    elif scenario == "add":
+                        (root / "extra.txt").write_text("extra")
+                    elif scenario == "rename":
+                        (root / "unrelated.txt").rename(root / "renamed.txt")
+                    commit()
+                git("fetch", ".", "HEAD")
+                git("switch", "--detach", original)
+                if scenario == "diverged":
+                    (root / "new-default.txt").write_text("new")
+                    commit()
+                def output(args, **kwargs):
+                    return real_output(args, cwd=directory, **kwargs)
+                with patch.object(subprocess, "check_output", output):
+                    if scenario == "valid":
+                        exec(guard, {"subprocess": subprocess, "paths": (".reviewsensei.yml",)})
+                    else:
+                        with self.assertRaises(SystemExit):
+                            exec(guard, {"subprocess": subprocess, "paths": (".reviewsensei.yml",)})
+
+    def test_default_branch_collision(self):
+        source = python_block("review-sensei-uninstall.yml")
+        with patch.dict(os.environ, {"DEFAULT_BRANCH": "review-sensei/uninstall"}):
+            with self.assertRaisesRegex(SystemExit, "must not be the default"):
+                exec(source, {})
 
 
 if __name__ == "__main__":
