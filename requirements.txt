@@ -1,8 +1,0 @@
-# Runtime
-pandas>=2.0
-matplotlib>=3.7
-seaborn>=0.13
-requests>=2.31
-jupyter>=1.0
-ipykernel>=6.0
-nbformat>=5.9
